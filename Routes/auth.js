@@ -6,7 +6,7 @@ const { emailTransporter, twilioClient } = require('../config/services');
 const { generateNumericOTP, generateAppSecret, verifyAppOTP } = require('../utils/otpUtils');
 
 // ============================================
-// REGISTRO DE USUARIO (Sin encriptación)
+// REGISTRO DE USUARIO (Devuelve userId)
 // ============================================
 router.post('/register', async (req, res) => {
   try {
@@ -20,13 +20,19 @@ router.post('/register', async (req, res) => {
     
     const newUser = new User({ 
       username, 
-      password, // Sin hash
+      password,
       email,
       phone
     });
     
     await newUser.save();
-    res.status(201).json({ message: 'Usuario registrado exitosamente' });
+    
+    // Devolver userId y username en la respuesta
+    res.status(201).json({ 
+      message: 'Usuario registrado exitosamente',
+      userId: newUser._id,
+      username: newUser.username
+    });
   } catch (error) {
     res.status(500).json({ message: 'Error al registrar usuario', error: error.message });
   }
@@ -75,7 +81,7 @@ router.post('/login', async (req, res) => {
       message: 'Credenciales válidas. Ingresa el código OTP',
       requiresMFA: true,
       mfaMethod: user.mfaMethod,
-      userId: user._id // Solo para identificar en el siguiente paso
+      userId: user._id
     });
     
   } catch (error) {
@@ -98,7 +104,7 @@ router.post('/verify-otp', async (req, res) => {
     // Verificar intentos fallidos
     if (user.otpAttempts >= 5) {
       const timeSinceLastAttempt = Date.now() - user.lastOtpAttempt;
-      if (timeSinceLastAttempt < 15 * 60 * 1000) { // 15 minutos
+      if (timeSinceLastAttempt < 15 * 60 * 1000) {
         return res.status(429).json({ 
           message: 'Demasiados intentos fallidos. Intenta en 15 minutos' 
         });
@@ -220,7 +226,7 @@ router.post('/enable-mfa-app', async (req, res) => {
     res.json({ 
       message: 'Escanea este código QR con Google Authenticator o Authy',
       qrCode,
-      secret // Por si quieren ingresarlo manualmente
+      secret
     });
   } catch (error) {
     res.status(500).json({ message: 'Error al habilitar MFA', error: error.message });
@@ -231,12 +237,11 @@ router.post('/enable-mfa-app', async (req, res) => {
 // FUNCIONES AUXILIARES
 // ============================================
 
-// Enviar OTP por Email
 async function sendEmailOTP(user) {
   const otp = generateNumericOTP();
   
   user.tempOTP = otp;
-  user.otpExpiry = Date.now() + 10 * 60 * 1000; // 10 minutos
+  user.otpExpiry = Date.now() + 10 * 60 * 1000;
   await user.save();
   
   await emailTransporter.sendMail({
@@ -251,12 +256,11 @@ async function sendEmailOTP(user) {
   });
 }
 
-// Enviar OTP por SMS
 async function sendSMSOTP(user) {
   const otp = generateNumericOTP();
   
   user.tempOTP = otp;
-  user.otpExpiry = Date.now() + 10 * 60 * 1000; // 10 minutos
+  user.otpExpiry = Date.now() + 10 * 60 * 1000;
   await user.save();
   
   await twilioClient.messages.create({
