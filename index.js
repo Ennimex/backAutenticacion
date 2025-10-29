@@ -1,3 +1,4 @@
+require('dotenv').config();
 const cors = require('cors');
 const express = require('express');
 const app = express();
@@ -16,7 +17,13 @@ app.get('/', (req, res) => {
     res.send('¡Servidor funcionando correctamente!');
 });
 
+const connectDB = require('./config/db');
 const authRoutes = require('./Routes/auth');
+
+// Conectar a la base de datos
+connectDB();
+
 app.use('/api/auth', authRoutes);
 
-module.exports = app;
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🚀 Servidor corriendo en puerto ${PORT}`));
