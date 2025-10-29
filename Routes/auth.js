@@ -121,6 +121,7 @@ router.post('/request-otp', async (req, res) => {
     await user.save();
     
     if (method === 'email') {
+      // Esto puede fallar si las credenciales SMTP son incorrectas o la configuración es débil
       await emailTransporter.sendMail({
         from: process.env.EMAIL_USER,
         to: user.email,
@@ -153,8 +154,12 @@ router.post('/request-otp', async (req, res) => {
     }
     
   } catch (error) {
+    // 🔑 CORRECCIÓN 1: Registrar el error detallado para depuración en Render
+    console.error('ERROR NODEMAILER DETALLADO:', error); 
+
     res.status(500).json({ 
-      message: 'Error al enviar código', 
+      // 🔑 CORRECCIÓN 2: Actualizar el mensaje para guiar al usuario
+      message: 'Error al enviar código. Revisa los logs de Render para el detalle del error SMTP.', 
       error: error.message 
     });
   }
