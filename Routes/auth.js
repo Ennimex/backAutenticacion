@@ -12,7 +12,6 @@ router.post('/register', async (req, res) => {
   try {
     const { username, password, email, phone } = req.body;
     
-    // Verificar si el usuario ya existe
     const existingUser = await User.findOne({ username });
     if (existingUser) {
       return res.status(400).json({ message: 'El usuario ya existe' });
@@ -27,7 +26,6 @@ router.post('/register', async (req, res) => {
     
     await newUser.save();
     
-    // Devolver userId y username en la respuesta
     res.status(201).json({ 
       message: 'Usuario registrado exitosamente',
       userId: newUser._id,
@@ -50,13 +48,12 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ message: 'Contraseña o usuario incorrecto' });
     }
     
-    // Verificar contraseña (comparación directa)
     if (user.password !== password) {
       return res.status(401).json({ message: 'Contraseña o usuario incorrecto' });
     }
     
-    // Si no tiene MFA habilitado, generar token directamente
-    if (!user.mfaEnabled || user.mfaMethod === 'none') {
+    // Si no tiene MFA habilitado
+    if (!user.mfaEnabled || !user.mfaMethods || user.mfaMethods.length === 0) {
       const token = jwt.sign(
         { userId: user._id, username: user.username },
         process.env.JWT_SECRET,
@@ -64,23 +61,17 @@ router.post('/login', async (req, res) => {
       );
       
       return res.json({ 
-        message: 'Login exitoso',
+        message: 'Inicio de sesión exitoso',
         token,
         requiresMFA: false
       });
     }
     
-    // Si tiene MFA, enviar OTP según el método
-    if (user.mfaMethod === 'email') {
-      await sendEmailOTP(user);
-    } else if (user.mfaMethod === 'sms') {
-      await sendSMSOTP(user);
-    }
-    
+    // ✨ NUEVO: Devolver métodos disponibles sin enviar OTP todavía
     res.json({ 
-      message: 'Credenciales válidas. Ingresa el código OTP',
+      message: 'Credenciales válidas. Selecciona un método de verificación',
       requiresMFA: true,
-      mfaMethod: user.mfaMethod,
+      mfaMethods: user.mfaMethods,
       userId: user._id
     });
     
@@ -90,41 +81,134 @@ router.post('/login', async (req, res) => {
 });
 
 // ============================================
-// VERIFICAR OTP (Paso 2: Validar código)
+// ✨ NUEVO: SOLICITAR OTP (Paso 2: Usuario elige método)
 // ============================================
-router.post('/verify-otp', async (req, res) => {
+router.post('/request-otp', async (req, res) => {
   try {
-    const { userId, otp } = req.body;
+    const { userId, method } = req.body;
+    
+    if (!method || !['email', 'sms', 'app'].includes(method)) {
+      return res.status(400).json({ 
+        message: 'Método inválido. Usa: email, sms o app' 
+      });
+    }
     
     const user = await User.findById(userId);
     if (!user) {
       return res.status(404).json({ message: 'Usuario no encontrado' });
     }
     
-    // Verificar intentos fallidos
+    // Verificar que el método esté habilitado
+    if (!user.mfaMethods || !user.mfaMethods.includes(method)) {
+      return res.status(400).json({ 
+        message: 'Este método MFA no está configurado para tu cuenta' 
+      });
+    }
+    
+    // Si es app, no se envía OTP (usa TOTP)
+    if (method === 'app') {
+      return res.json({ 
+        message: 'Ingresa el código de tu aplicación autenticadora',
+        method: 'app'
+      });
+    }
+    
+    // Generar y enviar OTP solo al método seleccionado
+    const otp = generateNumericOTP();
+    user.tempOTP = otp;
+    user.otpExpiry = Date.now() + 10 * 60 * 1000;
+    user.selectedMfaMethod = method; // Guardar método seleccionado
+    await user.save();
+    
+    if (method === 'email') {
+      await emailTransporter.sendMail({
+        from: process.env.EMAIL_USER,
+        to: user.email,
+        subject: 'Código de verificación',
+        html: `
+          <h2>Código de verificación</h2>
+          <p>Tu código de verificación es: <strong>${otp}</strong></p>
+          <p>Este código expira en 10 minutos.</p>
+        `
+      });
+      
+      return res.json({ 
+        message: `Código enviado a ${user.email.substring(0, 3)}***@***`,
+        method: 'email'
+      });
+    }
+    
+    if (method === 'sms') {
+      await twilioClient.messages.create({
+        body: `Tu código de verificación es: ${otp}. Válido por 10 minutos.`,
+        from: process.env.TWILIO_PHONE_NUMBER,
+        to: user.phone
+      });
+      
+      const maskedPhone = user.phone.substring(0, 6) + '****';
+      return res.json({ 
+        message: `Código enviado a ${maskedPhone}`,
+        method: 'sms'
+      });
+    }
+    
+  } catch (error) {
+    res.status(500).json({ 
+      message: 'Error al enviar código', 
+      error: error.message 
+    });
+  }
+});
+
+// ============================================
+// VERIFICAR OTP (Paso 3: Validar código)
+// ============================================
+router.post('/verify-otp', async (req, res) => {
+  try {
+    const { userId, otp, method } = req.body;
+    
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ message: 'Usuario no encontrado' });
+    }
+    
+    // Verificar rate limiting
     if (user.otpAttempts >= 5) {
-      const timeSinceLastAttempt = Date.now() - user.lastOtpAttempt;
-      if (timeSinceLastAttempt < 15 * 60 * 1000) {
+      const timeSinceLastAttempt = Date.now() - (user.lastOtpAttempt || 0);
+      if (timeSinceLastAttempt < 60000) {
         return res.status(429).json({ 
-          message: 'Demasiados intentos fallidos. Intenta en 15 minutos' 
+          message: 'Demasiados intentos fallidos. Intenta en 1 minuto' 
         });
       }
       user.otpAttempts = 0;
     }
+
+    // Determinar método usado
+    let methodUsed = method || user.selectedMfaMethod;
+    if (!methodUsed && user.mfaMethods?.length === 1) {
+      methodUsed = user.mfaMethods[0];
+    }
     
+    if (!methodUsed) {
+      return res.status(400).json({ 
+        message: 'Se requiere especificar el método MFA usado' 
+      });
+    }
+
     let isValid = false;
-    
+
     // Verificar según el método
-    if (user.mfaMethod === 'app') {
+    if (methodUsed === 'app') {
       isValid = verifyAppOTP(user.otpSecret, otp);
-    } else if (user.mfaMethod === 'email' || user.mfaMethod === 'sms') {
-      // Verificar expiración
-      if (Date.now() > user.otpExpiry) {
+    } else if (methodUsed === 'email' || methodUsed === 'sms') {
+      if (!user.otpExpiry || Date.now() > user.otpExpiry) {
         return res.status(400).json({ message: 'El código ha expirado' });
       }
       isValid = user.tempOTP === otp;
+    } else {
+      return res.status(400).json({ message: 'Método MFA no soportado' });
     }
-    
+
     if (!isValid) {
       user.otpAttempts += 1;
       user.lastOtpAttempt = Date.now();
@@ -136,10 +220,11 @@ router.post('/verify-otp', async (req, res) => {
       });
     }
     
-    // OTP válido - generar token JWT
+    // OTP válido - limpiar y generar token
     user.otpAttempts = 0;
     user.tempOTP = undefined;
     user.otpExpiry = undefined;
+    user.selectedMfaMethod = undefined;
     await user.save();
     
     const token = jwt.sign(
@@ -154,7 +239,10 @@ router.post('/verify-otp', async (req, res) => {
     });
     
   } catch (error) {
-    res.status(500).json({ message: 'Error al verificar OTP', error: error.message });
+    res.status(500).json({ 
+      message: 'Error al verificar OTP', 
+      error: error.message 
+    });
   }
 });
 
@@ -170,13 +258,28 @@ router.post('/enable-mfa-email', async (req, res) => {
       return res.status(404).json({ message: 'Usuario no encontrado' });
     }
     
+    if (!user.email) {
+      return res.status(400).json({ 
+        message: 'Debes tener un email registrado para habilitar este método' 
+      });
+    }
+    
     user.mfaEnabled = true;
-    user.mfaMethod = 'email';
+    user.mfaMethods = user.mfaMethods || [];
+    if (!user.mfaMethods.includes('email')) {
+      user.mfaMethods.push('email');
+    }
     await user.save();
     
-    res.json({ message: 'MFA por email habilitado exitosamente' });
+    res.json({ 
+      message: 'MFA por email habilitado exitosamente', 
+      mfaMethods: user.mfaMethods 
+    });
   } catch (error) {
-    res.status(500).json({ message: 'Error al habilitar MFA', error: error.message });
+    res.status(500).json({ 
+      message: 'Error al habilitar MFA', 
+      error: error.message 
+    });
   }
 });
 
@@ -192,14 +295,29 @@ router.post('/enable-mfa-sms', async (req, res) => {
       return res.status(404).json({ message: 'Usuario no encontrado' });
     }
     
+    if (!phone) {
+      return res.status(400).json({ 
+        message: 'Se requiere un número de teléfono' 
+      });
+    }
+    
     user.phone = phone;
     user.mfaEnabled = true;
-    user.mfaMethod = 'sms';
+    user.mfaMethods = user.mfaMethods || [];
+    if (!user.mfaMethods.includes('sms')) {
+      user.mfaMethods.push('sms');
+    }
     await user.save();
     
-    res.json({ message: 'MFA por SMS habilitado exitosamente' });
+    res.json({ 
+      message: 'MFA por SMS habilitado exitosamente', 
+      mfaMethods: user.mfaMethods 
+    });
   } catch (error) {
-    res.status(500).json({ message: 'Error al habilitar MFA', error: error.message });
+    res.status(500).json({ 
+      message: 'Error al habilitar MFA', 
+      error: error.message 
+    });
   }
 });
 
@@ -215,59 +333,97 @@ router.post('/enable-mfa-app', async (req, res) => {
       return res.status(404).json({ message: 'Usuario no encontrado' });
     }
     
-    // Generar secret y QR code
     const { secret, qrCode } = await generateAppSecret(user.username);
     
     user.otpSecret = secret;
     user.mfaEnabled = true;
-    user.mfaMethod = 'app';
+    user.mfaMethods = user.mfaMethods || [];
+    if (!user.mfaMethods.includes('app')) {
+      user.mfaMethods.push('app');
+    }
     await user.save();
     
     res.json({ 
       message: 'Escanea este código QR con Google Authenticator o Authy',
       qrCode,
-      secret
+      secret,
+      mfaMethods: user.mfaMethods
     });
   } catch (error) {
-    res.status(500).json({ message: 'Error al habilitar MFA', error: error.message });
+    res.status(500).json({ 
+      message: 'Error al habilitar MFA', 
+      error: error.message 
+    });
   }
 });
 
 // ============================================
-// FUNCIONES AUXILIARES
+// ✨ NUEVO: OBTENER MÉTODOS MFA DEL USUARIO
 // ============================================
+router.get('/mfa-methods/:userId', async (req, res) => {
+  try {
+    const user = await User.findById(req.params.userId);
+    if (!user) {
+      return res.status(404).json({ message: 'Usuario no encontrado' });
+    }
+    
+    res.json({ 
+      mfaEnabled: user.mfaEnabled || false,
+      mfaMethods: user.mfaMethods || [],
+      hasEmail: !!user.email,
+      hasPhone: !!user.phone
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      message: 'Error al obtener métodos MFA', 
+      error: error.message 
+    });
+  }
+});
 
-async function sendEmailOTP(user) {
-  const otp = generateNumericOTP();
-  
-  user.tempOTP = otp;
-  user.otpExpiry = Date.now() + 10 * 60 * 1000;
-  await user.save();
-  
-  await emailTransporter.sendMail({
-    from: process.env.EMAIL_USER,
-    to: user.email,
-    subject: 'Código de verificación',
-    html: `
-      <h2>Código de verificación</h2>
-      <p>Tu código de verificación es: <strong>${otp}</strong></p>
-      <p>Este código expira en 10 minutos.</p>
-    `
-  });
-}
-
-async function sendSMSOTP(user) {
-  const otp = generateNumericOTP();
-  
-  user.tempOTP = otp;
-  user.otpExpiry = Date.now() + 10 * 60 * 1000;
-  await user.save();
-  
-  await twilioClient.messages.create({
-    body: `Tu código de verificación es: ${otp}. Válido por 10 minutos.`,
-    from: process.env.TWILIO_PHONE_NUMBER,
-    to: user.phone
-  });
-}
+// ============================================
+// ✨ NUEVO: DESHABILITAR UN MÉTODO MFA
+// ============================================
+router.post('/disable-mfa-method', async (req, res) => {
+  try {
+    const { userId, method } = req.body;
+    
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ message: 'Usuario no encontrado' });
+    }
+    
+    if (!user.mfaMethods || !user.mfaMethods.includes(method)) {
+      return res.status(400).json({ 
+        message: 'Este método no está habilitado' 
+      });
+    }
+    
+    user.mfaMethods = user.mfaMethods.filter(m => m !== method);
+    
+    // Si no quedan métodos, deshabilitar MFA completamente
+    if (user.mfaMethods.length === 0) {
+      user.mfaEnabled = false;
+    }
+    
+    // Limpiar datos específicos del método
+    if (method === 'app') {
+      user.otpSecret = undefined;
+    }
+    
+    await user.save();
+    
+    res.json({ 
+      message: `MFA por ${method} deshabilitado exitosamente`,
+      mfaMethods: user.mfaMethods,
+      mfaEnabled: user.mfaEnabled
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      message: 'Error al deshabilitar método MFA', 
+      error: error.message 
+    });
+  }
+});
 
 module.exports = router;

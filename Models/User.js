@@ -8,10 +8,11 @@ const userSchema = new mongoose.Schema({
   
   // Configuración MFA
   mfaEnabled: { type: Boolean, default: false },
-  mfaMethod: { 
-    type: String, 
-    enum: ['email', 'app', 'sms', 'none'],
-    default: 'none'
+  // Permite múltiples métodos seleccionados por el usuario
+  mfaMethods: {
+    type: [String],
+    enum: ['email', 'app', 'sms'],
+    default: []
   },
   
   // Para OTP por aplicación (Google Authenticator, Authy, etc.)
@@ -20,6 +21,13 @@ const userSchema = new mongoose.Schema({
   // Para almacenar OTP temporales (email y SMS)
   tempOTP: { type: String },
   otpExpiry: { type: Date },
+  
+  // ✨ NUEVO: Para recordar qué método eligió el usuario en este login
+  selectedMfaMethod: { 
+    type: String, 
+    enum: ['email', 'app', 'sms'],
+    default: null 
+  },
   
   // Para controlar intentos fallidos
   otpAttempts: { type: Number, default: 0 },
