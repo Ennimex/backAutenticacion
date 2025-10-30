@@ -1,8 +1,9 @@
-const nodemailer = require('nodemailer');
 const twilio = require('twilio');
 const brevo = require('@getbrevo/brevo');
 
-// Configuración de Brevo (API, no SMTP)
+// ============================================
+// CONFIGURACIÓN DE BREVO (Email via API)
+// ============================================
 const brevoClient = new brevo.TransactionalEmailsApi();
 brevoClient.setApiKey(
   brevo.TransactionalEmailsApiApiKeys.apiKey,
@@ -10,7 +11,7 @@ brevoClient.setApiKey(
 );
 
 // Función helper para enviar emails con Brevo
-async function sendEmailBrevo({ to, subject, html }) {
+async function sendEmail({ to, subject, html }) {
   const sendSmtpEmail = new brevo.SendSmtpEmail();
   
   sendSmtpEmail.subject = subject;
@@ -24,13 +25,16 @@ async function sendEmailBrevo({ to, subject, html }) {
   return await brevoClient.sendTransacEmail(sendSmtpEmail);
 }
 
-// Configuración de Twilio para SMS
+// ============================================
+// CONFIGURACIÓN DE TWILIO (SMS)
+// ============================================
 const twilioClient = twilio(
   process.env.TWILIO_ACCOUNT_SID,
   process.env.TWILIO_AUTH_TOKEN
 );
 
+// ⚠️ IMPORTANTE: Exportar sendEmail, NO emailTransporter
 module.exports = { 
-  sendEmailBrevo, 
-  twilioClient 
+  sendEmail,      // ✅ Función de Brevo
+  twilioClient    // ✅ Cliente de Twilio
 };
