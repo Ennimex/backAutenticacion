@@ -2,19 +2,45 @@ const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
 const User = require('../Models/User');
-const { sendEmail, twilioClient } = require('../config/services'); // ✅ Cambio aquí
+const { sendEmail, twilioClient } = require('../config/services');
 const { generateNumericOTP, generateAppSecret, verifyAppOTP } = require('../utils/otpUtils');
 
 // ============================================
-// REGISTRO DE USUARIO (Devuelve userId)
+// REGISTRO DE USUARIO (Con validación de duplicados)
 // ============================================
 router.post('/register', async (req, res) => {
   try {
     const { username, password, email, phone } = req.body;
     
+    // ✅ Validar que username no exista
     const existingUser = await User.findOne({ username });
     if (existingUser) {
-      return res.status(400).json({ message: 'El usuario ya existe' });
+      return res.status(400).json({ 
+        message: 'El usuario ya existe',
+        field: 'username' 
+      });
+    }
+    
+    // ✅ Validar que email no exista (si se proporciona)
+    if (email) {
+      const existingEmail = await User.findOne({ email });
+      if (existingEmail) {
+        return res.status(400).json({ 
+          message: 'Este correo electrónico ya está registrado',
+          field: 'email'
+        });
+      }
+    }
+    
+    // ✅ Validar que teléfono no exista (si se proporciona)
+    if (phone) {
+      const existingPhone = await User.findOne({ phone });
+      if (existingPhone) {
+        return res.status(400).json({ 
+          message: 'Este número de teléfono ya está registrado',
+          field: 'phone'
+        });
+      }
     }
     
     const newUser = new User({ 
@@ -32,7 +58,50 @@ router.post('/register', async (req, res) => {
       username: newUser.username
     });
   } catch (error) {
-    res.status(500).json({ message: 'Error al registrar usuario', error: error.message });
+    res.status(500).json({ 
+      message: 'Error al registrar usuario', 
+      error: error.message 
+    });
+  }
+});
+
+// ============================================
+// ✨ NUEVO: VERIFICAR DISPONIBILIDAD DE DATOS
+// ============================================
+router.post('/check-availability', async (req, res) => {
+  try {
+    const { username, email, phone } = req.body;
+    
+    const response = {
+      usernameAvailable: true,
+      emailAvailable: true,
+      phoneAvailable: true
+    };
+    
+    // Verificar username
+    if (username) {
+      const existingUser = await User.findOne({ username });
+      response.usernameAvailable = !existingUser;
+    }
+    
+    // Verificar email
+    if (email) {
+      const existingEmail = await User.findOne({ email });
+      response.emailAvailable = !existingEmail;
+    }
+    
+    // Verificar phone
+    if (phone) {
+      const existingPhone = await User.findOne({ phone });
+      response.phoneAvailable = !existingPhone;
+    }
+    
+    res.json(response);
+  } catch (error) {
+    res.status(500).json({ 
+      message: 'Error al verificar disponibilidad', 
+      error: error.message 
+    });
   }
 });
 
@@ -119,7 +188,7 @@ router.post('/request-otp', async (req, res) => {
     user.selectedMfaMethod = method;
     await user.save();
     
-    // ✅ ENVÍO POR EMAIL CON BREVO
+    // ENVÍO POR EMAIL CON BREVO
     if (method === 'email') {
       try {
         await sendEmail({
@@ -315,6 +384,19 @@ router.post('/enable-mfa-sms', async (req, res) => {
     if (!phone) {
       return res.status(400).json({ 
         message: 'Se requiere un número de teléfono' 
+      });
+    }
+    
+    // ✅ Validar que el teléfono no esté usado por otro usuario
+    const existingPhone = await User.findOne({ 
+      phone: phone, 
+      _id: { $ne: user._id } // Excluir el usuario actual
+    });
+    
+    if (existingPhone) {
+      return res.status(400).json({ 
+        message: 'Este número de teléfono ya está registrado por otro usuario',
+        field: 'phone'
       });
     }
     
