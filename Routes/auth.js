@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
 const User = require('../Models/User');
-const { emailTransporter, twilioClient } = require('../config/services');
+const { sendEmail, twilioClient } = require('../config/services'); // ✅ Cambio aquí
 const { generateNumericOTP, generateAppSecret, verifyAppOTP } = require('../utils/otpUtils');
 
 // ============================================
@@ -67,7 +67,6 @@ router.post('/login', async (req, res) => {
       });
     }
     
-    // ✨ NUEVO: Devolver métodos disponibles sin enviar OTP todavía
     res.json({ 
       message: 'Credenciales válidas. Selecciona un método de verificación',
       requiresMFA: true,
@@ -81,7 +80,7 @@ router.post('/login', async (req, res) => {
 });
 
 // ============================================
-// ✨ NUEVO: SOLICITAR OTP (Paso 2: Usuario elige método)
+// SOLICITAR OTP (Paso 2: Usuario elige método)
 // ============================================
 router.post('/request-otp', async (req, res) => {
   try {
@@ -117,49 +116,62 @@ router.post('/request-otp', async (req, res) => {
     const otp = generateNumericOTP();
     user.tempOTP = otp;
     user.otpExpiry = Date.now() + 10 * 60 * 1000;
-    user.selectedMfaMethod = method; // Guardar método seleccionado
+    user.selectedMfaMethod = method;
     await user.save();
     
+    // ✅ ENVÍO POR EMAIL CON BREVO
     if (method === 'email') {
-      // Esto puede fallar si las credenciales SMTP son incorrectas o la configuración es débil
-      await emailTransporter.sendMail({
-        from: process.env.EMAIL_USER,
-        to: user.email,
-        subject: 'Código de verificación',
-        html: `
-          <h2>Código de verificación</h2>
-          <p>Tu código de verificación es: <strong>${otp}</strong></p>
-          <p>Este código expira en 10 minutos.</p>
-        `
-      });
-      
-      return res.json({ 
-        message: `Código enviado a ${user.email.substring(0, 3)}***@***`,
-        method: 'email'
-      });
+      try {
+        await sendEmail({
+          to: user.email,
+          subject: 'Código de verificación',
+          html: `
+            <h2>Código de verificación</h2>
+            <p>Tu código de verificación es: <strong>${otp}</strong></p>
+            <p>Este código expira en 10 minutos.</p>
+          `
+        });
+        
+        return res.json({ 
+          message: `Código enviado a ${user.email.substring(0, 3)}***@***`,
+          method: 'email'
+        });
+      } catch (emailError) {
+        console.error('❌ ERROR AL ENVIAR EMAIL:', emailError);
+        return res.status(500).json({ 
+          message: 'No se pudo enviar el código por email. Intenta con otro método.',
+          error: emailError.message
+        });
+      }
     }
     
+    // ENVÍO POR SMS CON TWILIO
     if (method === 'sms') {
-      await twilioClient.messages.create({
-        body: `Tu código de verificación es: ${otp}. Válido por 10 minutos.`,
-        from: process.env.TWILIO_PHONE_NUMBER,
-        to: user.phone
-      });
-      
-      const maskedPhone = user.phone.substring(0, 6) + '****';
-      return res.json({ 
-        message: `Código enviado a ${maskedPhone}`,
-        method: 'sms'
-      });
+      try {
+        await twilioClient.messages.create({
+          body: `Tu código de verificación es: ${otp}. Válido por 10 minutos.`,
+          from: process.env.TWILIO_PHONE_NUMBER,
+          to: user.phone
+        });
+        
+        const maskedPhone = user.phone.substring(0, 6) + '****';
+        return res.json({ 
+          message: `Código enviado a ${maskedPhone}`,
+          method: 'sms'
+        });
+      } catch (smsError) {
+        console.error('❌ ERROR AL ENVIAR SMS:', smsError);
+        return res.status(500).json({ 
+          message: 'No se pudo enviar el código por SMS',
+          error: smsError.message
+        });
+      }
     }
     
   } catch (error) {
-    // 🔑 CORRECCIÓN 1: Registrar el error detallado para depuración en Render
-    console.error('ERROR NODEMAILER DETALLADO:', error); 
-
+    console.error('ERROR EN REQUEST-OTP:', error);
     res.status(500).json({ 
-      // 🔑 CORRECCIÓN 2: Actualizar el mensaje para guiar al usuario
-      message: 'Error al enviar código. Revisa los logs de Render para el detalle del error SMTP.', 
+      message: 'Error al procesar solicitud de OTP', 
       error: error.message 
     });
   }
@@ -363,7 +375,7 @@ router.post('/enable-mfa-app', async (req, res) => {
 });
 
 // ============================================
-// ✨ NUEVO: OBTENER MÉTODOS MFA DEL USUARIO
+// OBTENER MÉTODOS MFA DEL USUARIO
 // ============================================
 router.get('/mfa-methods/:userId', async (req, res) => {
   try {
@@ -387,7 +399,7 @@ router.get('/mfa-methods/:userId', async (req, res) => {
 });
 
 // ============================================
-// ✨ NUEVO: DESHABILITAR UN MÉTODO MFA
+// DESHABILITAR UN MÉTODO MFA
 // ============================================
 router.post('/disable-mfa-method', async (req, res) => {
   try {
