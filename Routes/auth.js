@@ -5,7 +5,7 @@ const crypto = require('crypto');
 const User = require('../Models/User');
 const { sendEmail, twilioClient } = require('../config/services');
 const { generateNumericOTP, generateAppSecret, verifyAppOTP } = require('../utils/otpUtils');
-
+//backend
 // ============================================
 // REGISTRO DE USUARIO (Con validación de duplicados)
 // ============================================
