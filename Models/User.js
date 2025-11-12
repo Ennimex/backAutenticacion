@@ -68,7 +68,7 @@ const userSchema = new mongoose.Schema({
   },
   
   // ============================================
-  // 🆕 RECUPERACIÓN DE CONTRASEÑA
+  // RECUPERACIÓN DE CONTRASEÑA
   // ============================================
   resetPasswordCode: {
     type: String,
@@ -81,7 +81,25 @@ const userSchema = new mongoose.Schema({
   resetPasswordAttempts: {
     type: Number,
     default: 0
-  }
+  },
+  
+  // ============================================
+  // ✅ DISPOSITIVOS CONFIABLES (NUEVO)
+  // ============================================
+  trustedDevices: [{
+    deviceId: { 
+      type: String, 
+      required: true 
+    },
+    createdAt: { 
+      type: Date, 
+      default: Date.now 
+    },
+    expiresAt: { 
+      type: Date, 
+      required: true 
+    }
+  }]
 }, {
   timestamps: true // Agrega createdAt y updatedAt automáticamente
 });
@@ -101,5 +119,9 @@ userSchema.index(
     partialFilterExpression: { resetPasswordExpiry: { $exists: true } }
   }
 );
+
+// ✅ Índice para dispositivos confiables
+userSchema.index({ 'trustedDevices.deviceId': 1 });
+userSchema.index({ 'trustedDevices.expiresAt': 1 });
 
 module.exports = mongoose.model('User', userSchema);

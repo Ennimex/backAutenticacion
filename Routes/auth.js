@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const User = require('../Models/User');
 const { sendEmail, twilioClient } = require('../config/services');
 const { generateNumericOTP, generateAppSecret, verifyAppOTP } = require('../utils/otpUtils');
@@ -12,7 +13,6 @@ router.post('/register', async (req, res) => {
   try {
     const { username, password, email, phone } = req.body;
     
-    // ✅ Validar que username no exista
     const existingUser = await User.findOne({ username });
     if (existingUser) {
       return res.status(400).json({ 
@@ -21,7 +21,6 @@ router.post('/register', async (req, res) => {
       });
     }
     
-    // ✅ Validar que email no exista (si se proporciona)
     if (email) {
       const existingEmail = await User.findOne({ email });
       if (existingEmail) {
@@ -32,7 +31,6 @@ router.post('/register', async (req, res) => {
       }
     }
     
-    // ✅ Validar que teléfono no exista (si se proporciona)
     if (phone) {
       const existingPhone = await User.findOne({ phone });
       if (existingPhone) {
@@ -47,7 +45,8 @@ router.post('/register', async (req, res) => {
       username, 
       password,
       email,
-      phone
+      phone,
+      trustedDevices: [] // ✅ Inicializar array de dispositivos confiables
     });
     
     await newUser.save();
@@ -66,7 +65,7 @@ router.post('/register', async (req, res) => {
 });
 
 // ============================================
-// ✨ NUEVO: VERIFICAR DISPONIBILIDAD DE DATOS
+// VERIFICAR DISPONIBILIDAD DE DATOS
 // ============================================
 router.post('/check-availability', async (req, res) => {
   try {
@@ -78,19 +77,16 @@ router.post('/check-availability', async (req, res) => {
       phoneAvailable: true
     };
     
-    // Verificar username
     if (username) {
       const existingUser = await User.findOne({ username });
       response.usernameAvailable = !existingUser;
     }
     
-    // Verificar email
     if (email) {
       const existingEmail = await User.findOne({ email });
       response.emailAvailable = !existingEmail;
     }
     
-    // Verificar phone
     if (phone) {
       const existingPhone = await User.findOne({ phone });
       response.phoneAvailable = !existingPhone;
@@ -106,11 +102,32 @@ router.post('/check-availability', async (req, res) => {
 });
 
 // ============================================
-// INICIAR SESIÓN (Paso 1: Validar credenciales)
+// 🆕 FUNCIÓN AUXILIAR: Verificar si el dispositivo es confiable
+// ============================================
+function isDeviceTrusted(user, deviceId) {
+  if (!user.trustedDevices || !deviceId) return false;
+  
+  const device = user.trustedDevices.find(d => d.deviceId === deviceId);
+  if (!device) return false;
+  
+  // Verificar si el dispositivo ha expirado (30 días)
+  const expiryDate = new Date(device.expiresAt);
+  return expiryDate > new Date();
+}
+
+// ============================================
+// 🆕 FUNCIÓN AUXILIAR: Generar ID único de dispositivo
+// ============================================
+function generateDeviceId() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+// ============================================
+// INICIAR SESIÓN (✨ CON SOPORTE PARA RECORDAR DISPOSITIVO)
 // ============================================
 router.post('/login', async (req, res) => {
   try {
-    const { username, password } = req.body;
+    const { username, password, deviceId } = req.body;
     
     const user = await User.findOne({ username });
     if (!user) {
@@ -121,8 +138,10 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ message: 'Contraseña o usuario incorrecto' });
     }
     
-    // Si no tiene MFA habilitado
-    if (!user.mfaEnabled || !user.mfaMethods || user.mfaMethods.length === 0) {
+    // ✅ SI NO TIENE MFA O SI EL DISPOSITIVO ES CONFIABLE
+    const deviceIsTrusted = isDeviceTrusted(user, deviceId);
+    
+    if (!user.mfaEnabled || !user.mfaMethods || user.mfaMethods.length === 0 || deviceIsTrusted) {
       const token = jwt.sign(
         { userId: user._id, username: user.username },
         process.env.JWT_SECRET,
@@ -132,10 +151,12 @@ router.post('/login', async (req, res) => {
       return res.json({ 
         message: 'Inicio de sesión exitoso',
         token,
-        requiresMFA: false
+        requiresMFA: false,
+        deviceTrusted: deviceIsTrusted
       });
     }
     
+    // ✅ SI TIENE MFA Y EL DISPOSITIVO NO ES CONFIABLE
     res.json({ 
       message: 'Credenciales válidas. Selecciona un método de verificación',
       requiresMFA: true,
@@ -168,14 +189,12 @@ router.post('/request-otp', async (req, res) => {
       return res.status(404).json({ message: 'Usuario no encontrado' });
     }
     
-    // Verificar que el método esté habilitado
     if (!user.mfaMethods || !user.mfaMethods.includes(method)) {
       return res.status(400).json({ 
         message: 'Este método MFA no está configurado para tu cuenta' 
       });
     }
     
-    // Si es app, no se envía OTP (usa TOTP)
     if (method === 'app') {
       return res.json({ 
         message: 'Ingresa el código de tu aplicación autenticadora',
@@ -183,14 +202,12 @@ router.post('/request-otp', async (req, res) => {
       });
     }
     
-    // Generar y enviar OTP solo al método seleccionado
     const otp = generateNumericOTP();
     user.tempOTP = otp;
     user.otpExpiry = Date.now() + 10 * 60 * 1000;
     user.selectedMfaMethod = method;
     await user.save();
     
-    // ENVÍO POR EMAIL CON BREVO
     if (method === 'email') {
       try {
         await sendEmail({
@@ -216,7 +233,6 @@ router.post('/request-otp', async (req, res) => {
       }
     }
     
-    // ENVÍO POR SMS CON TWILIO
     if (method === 'sms') {
       try {
         await twilioClient.messages.create({
@@ -249,18 +265,17 @@ router.post('/request-otp', async (req, res) => {
 });
 
 // ============================================
-// VERIFICAR OTP (Paso 3: Validar código)
+// VERIFICAR OTP (✨ CON OPCIÓN DE RECORDAR DISPOSITIVO)
 // ============================================
 router.post('/verify-otp', async (req, res) => {
   try {
-    const { userId, otp, method } = req.body;
+    const { userId, otp, method, rememberDevice } = req.body;
     
     const user = await User.findById(userId);
     if (!user) {
       return res.status(404).json({ message: 'Usuario no encontrado' });
     }
     
-    // Verificar rate limiting
     if (user.otpAttempts >= 5) {
       const timeSinceLastAttempt = Date.now() - (user.lastOtpAttempt || 0);
       if (timeSinceLastAttempt < 60000) {
@@ -271,7 +286,6 @@ router.post('/verify-otp', async (req, res) => {
       user.otpAttempts = 0;
     }
 
-    // Determinar método usado
     let methodUsed = method || user.selectedMfaMethod;
     if (!methodUsed && user.mfaMethods?.length === 1) {
       methodUsed = user.mfaMethods[0];
@@ -285,7 +299,6 @@ router.post('/verify-otp', async (req, res) => {
 
     let isValid = false;
 
-    // Verificar según el método
     if (methodUsed === 'app') {
       isValid = verifyAppOTP(user.otpSecret, otp);
     } else if (methodUsed === 'email' || methodUsed === 'sms') {
@@ -308,11 +321,35 @@ router.post('/verify-otp', async (req, res) => {
       });
     }
     
-    // OTP válido - limpiar y generar token
+    // ✅ OTP VÁLIDO - LIMPIAR Y GENERAR TOKEN
     user.otpAttempts = 0;
     user.tempOTP = undefined;
     user.otpExpiry = undefined;
     user.selectedMfaMethod = undefined;
+    
+    // ✅ SI EL USUARIO QUIERE RECORDAR EL DISPOSITIVO
+    let newDeviceId = null;
+    if (rememberDevice) {
+      newDeviceId = generateDeviceId();
+      
+      // Inicializar array si no existe
+      if (!user.trustedDevices) {
+        user.trustedDevices = [];
+      }
+      
+      // Agregar dispositivo confiable (válido por 30 días)
+      user.trustedDevices.push({
+        deviceId: newDeviceId,
+        createdAt: new Date(),
+        expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) // 30 días
+      });
+      
+      // Limpiar dispositivos expirados (mantener solo los últimos 5)
+      user.trustedDevices = user.trustedDevices
+        .filter(d => new Date(d.expiresAt) > new Date())
+        .slice(-5);
+    }
+    
     await user.save();
     
     const token = jwt.sign(
@@ -323,7 +360,8 @@ router.post('/verify-otp', async (req, res) => {
     
     res.json({ 
       message: 'Autenticación exitosa',
-      token
+      token,
+      deviceId: newDeviceId // ⚠️ IMPORTANTE: Guardar esto en el cliente (localStorage)
     });
     
   } catch (error) {
@@ -335,7 +373,64 @@ router.post('/verify-otp', async (req, res) => {
 });
 
 // ============================================
-// 🔐 RECUPERACIÓN DE CONTRASEÑA - PASO 1: SOLICITAR CÓDIGO
+// 🆕 VER DISPOSITIVOS CONFIABLES
+// ============================================
+router.get('/trusted-devices/:userId', async (req, res) => {
+  try {
+    const user = await User.findById(req.params.userId);
+    if (!user) {
+      return res.status(404).json({ message: 'Usuario no encontrado' });
+    }
+    
+    // Filtrar solo dispositivos activos
+    const activeDevices = (user.trustedDevices || [])
+      .filter(d => new Date(d.expiresAt) > new Date())
+      .map(d => ({
+        deviceId: d.deviceId.substring(0, 8) + '...', // Mostrar solo parte
+        createdAt: d.createdAt,
+        expiresAt: d.expiresAt
+      }));
+    
+    res.json({ 
+      devices: activeDevices,
+      count: activeDevices.length
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      message: 'Error al obtener dispositivos', 
+      error: error.message 
+    });
+  }
+});
+
+// ============================================
+// 🆕 ELIMINAR TODOS LOS DISPOSITIVOS CONFIABLES
+// ============================================
+router.post('/revoke-all-devices', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ message: 'Usuario no encontrado' });
+    }
+    
+    user.trustedDevices = [];
+    await user.save();
+    
+    res.json({ 
+      message: 'Todos los dispositivos confiables han sido revocados'
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      message: 'Error al revocar dispositivos', 
+      error: error.message 
+    });
+  }
+});
+
+// ============================================
+// RECUPERACIÓN DE CONTRASEÑA - PASO 1: SOLICITAR CÓDIGO
 // ============================================
 router.post('/forgot-password', async (req, res) => {
   try {
@@ -347,25 +442,20 @@ router.post('/forgot-password', async (req, res) => {
       });
     }
     
-    // Buscar usuario por email
     const user = await User.findOne({ email });
     if (!user) {
-      // Por seguridad, no revelar si el email existe o no
       return res.status(404).json({ 
         message: 'Si el correo existe en nuestro sistema, recibirás un código de verificación' 
       });
     }
     
-    // Generar código de 6 dígitos
     const resetCode = generateNumericOTP();
     
-    // Guardar código y expiración (10 minutos)
     user.resetPasswordCode = resetCode;
     user.resetPasswordExpiry = Date.now() + 10 * 60 * 1000;
     user.resetPasswordAttempts = 0;
     await user.save();
     
-    // Enviar email con el código
     try {
       await sendEmail({
         to: user.email,
@@ -409,7 +499,7 @@ router.post('/forgot-password', async (req, res) => {
 });
 
 // ============================================
-// 🔐 RECUPERACIÓN DE CONTRASEÑA - PASO 2: VERIFICAR CÓDIGO
+// RECUPERACIÓN DE CONTRASEÑA - PASO 2: VERIFICAR CÓDIGO
 // ============================================
 router.post('/verify-reset-code', async (req, res) => {
   try {
@@ -428,21 +518,18 @@ router.post('/verify-reset-code', async (req, res) => {
       });
     }
     
-    // Verificar rate limiting (máximo 5 intentos)
     if (user.resetPasswordAttempts >= 5) {
       return res.status(429).json({ 
         message: 'Demasiados intentos fallidos. Solicita un nuevo código.' 
       });
     }
     
-    // Verificar si el código expiró
     if (!user.resetPasswordExpiry || Date.now() > user.resetPasswordExpiry) {
       return res.status(400).json({ 
         message: 'El código ha expirado. Solicita uno nuevo.' 
       });
     }
     
-    // Verificar el código
     if (user.resetPasswordCode !== code) {
       user.resetPasswordAttempts += 1;
       await user.save();
@@ -453,7 +540,6 @@ router.post('/verify-reset-code', async (req, res) => {
       });
     }
     
-    // Código válido - generar token temporal para el paso 3
     const resetToken = jwt.sign(
       { 
         userId: user._id, 
@@ -461,7 +547,7 @@ router.post('/verify-reset-code', async (req, res) => {
         purpose: 'password-reset'
       },
       process.env.JWT_SECRET,
-      { expiresIn: '15m' } // Token válido por 15 minutos
+      { expiresIn: '15m' }
     );
     
     res.json({ 
@@ -479,7 +565,7 @@ router.post('/verify-reset-code', async (req, res) => {
 });
 
 // ============================================
-// 🔐 RECUPERACIÓN DE CONTRASEÑA - PASO 3: RESTABLECER CONTRASEÑA
+// RECUPERACIÓN DE CONTRASEÑA - PASO 3: RESTABLECER CONTRASEÑA
 // ============================================
 router.post('/reset-password', async (req, res) => {
   try {
@@ -491,7 +577,6 @@ router.post('/reset-password', async (req, res) => {
       });
     }
     
-    // Validar contraseña
     if (password.length < 8) {
       return res.status(400).json({ 
         message: 'La contraseña debe tener al menos 8 caracteres' 
@@ -504,7 +589,6 @@ router.post('/reset-password', async (req, res) => {
       });
     }
     
-    // Verificar token
     let decoded;
     try {
       decoded = jwt.verify(token, process.env.JWT_SECRET);
@@ -527,7 +611,6 @@ router.post('/reset-password', async (req, res) => {
       });
     }
     
-    // Buscar usuario y actualizar contraseña
     const user = await User.findById(decoded.userId);
     if (!user) {
       return res.status(404).json({ 
@@ -535,16 +618,16 @@ router.post('/reset-password', async (req, res) => {
       });
     }
     
-    // Actualizar contraseña y limpiar códigos de recuperación
-    user.password = password; // Asegúrate de hashear si usas bcrypt
+    user.password = password;
     user.resetPasswordCode = undefined;
     user.resetPasswordExpiry = undefined;
     user.resetPasswordAttempts = 0;
+    // ✅ Limpiar dispositivos confiables al cambiar contraseña (seguridad)
+    user.trustedDevices = [];
     await user.save();
     
     console.log(`✅ Contraseña restablecida para usuario: ${user.username}`);
     
-    // Opcional: enviar email de confirmación
     try {
       await sendEmail({
         to: user.email,
@@ -560,7 +643,6 @@ router.post('/reset-password', async (req, res) => {
       });
     } catch (emailError) {
       console.error('Error al enviar email de confirmación:', emailError);
-      // No retornar error, la contraseña ya fue cambiada
     }
     
     res.json({ 
@@ -631,10 +713,9 @@ router.post('/enable-mfa-sms', async (req, res) => {
       });
     }
     
-    // ✅ Validar que el teléfono no esté usado por otro usuario
     const existingPhone = await User.findOne({ 
       phone: phone, 
-      _id: { $ne: user._id } // Excluir el usuario actual
+      _id: { $ne: user._id }
     });
     
     if (existingPhone) {
@@ -744,12 +825,10 @@ router.post('/disable-mfa-method', async (req, res) => {
     
     user.mfaMethods = user.mfaMethods.filter(m => m !== method);
     
-    // Si no quedan métodos, deshabilitar MFA completamente
     if (user.mfaMethods.length === 0) {
       user.mfaEnabled = false;
     }
     
-    // Limpiar datos específicos del método
     if (method === 'app') {
       user.otpSecret = undefined;
     }
