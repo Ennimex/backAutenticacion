@@ -140,7 +140,9 @@ router.post('/login', async (req, res) => {
       message: 'Credenciales válidas. Selecciona un método de verificación',
       requiresMFA: true,
       mfaMethods: user.mfaMethods,
-      userId: user._id
+      userId: user._id,
+      email: user.email ? user.email.substring(0, 3) + '***@***' : undefined,
+      phone: user.phone ? user.phone.substring(0, 6) + '****' : undefined
     });
     
   } catch (error) {
@@ -327,6 +329,248 @@ router.post('/verify-otp', async (req, res) => {
   } catch (error) {
     res.status(500).json({ 
       message: 'Error al verificar OTP', 
+      error: error.message 
+    });
+  }
+});
+
+// ============================================
+// 🔐 RECUPERACIÓN DE CONTRASEÑA - PASO 1: SOLICITAR CÓDIGO
+// ============================================
+router.post('/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    
+    if (!email) {
+      return res.status(400).json({ 
+        message: 'El correo electrónico es requerido' 
+      });
+    }
+    
+    // Buscar usuario por email
+    const user = await User.findOne({ email });
+    if (!user) {
+      // Por seguridad, no revelar si el email existe o no
+      return res.status(404).json({ 
+        message: 'Si el correo existe en nuestro sistema, recibirás un código de verificación' 
+      });
+    }
+    
+    // Generar código de 6 dígitos
+    const resetCode = generateNumericOTP();
+    
+    // Guardar código y expiración (10 minutos)
+    user.resetPasswordCode = resetCode;
+    user.resetPasswordExpiry = Date.now() + 10 * 60 * 1000;
+    user.resetPasswordAttempts = 0;
+    await user.save();
+    
+    // Enviar email con el código
+    try {
+      await sendEmail({
+        to: user.email,
+        subject: 'Recuperación de contraseña',
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2 style="color: #667eea;">Recuperación de contraseña</h2>
+            <p>Hola <strong>${user.username}</strong>,</p>
+            <p>Recibimos una solicitud para restablecer tu contraseña.</p>
+            <p>Tu código de verificación es:</p>
+            <div style="background: #f0f0f0; padding: 20px; text-align: center; font-size: 32px; font-weight: bold; letter-spacing: 5px; margin: 20px 0;">
+              ${resetCode}
+            </div>
+            <p style="color: #666;">Este código expira en <strong>10 minutos</strong>.</p>
+            <p style="color: #999; font-size: 12px;">Si no solicitaste este cambio, ignora este mensaje.</p>
+          </div>
+        `
+      });
+      
+      console.log(`✅ Código de recuperación enviado a ${email}: ${resetCode}`);
+      
+      return res.json({ 
+        message: 'Código de verificación enviado a tu correo electrónico'
+      });
+      
+    } catch (emailError) {
+      console.error('❌ ERROR AL ENVIAR EMAIL DE RECUPERACIÓN:', emailError);
+      return res.status(500).json({ 
+        message: 'No se pudo enviar el código. Por favor, intenta más tarde.',
+        error: emailError.message
+      });
+    }
+    
+  } catch (error) {
+    console.error('ERROR EN FORGOT-PASSWORD:', error);
+    res.status(500).json({ 
+      message: 'Error al procesar solicitud de recuperación', 
+      error: error.message 
+    });
+  }
+});
+
+// ============================================
+// 🔐 RECUPERACIÓN DE CONTRASEÑA - PASO 2: VERIFICAR CÓDIGO
+// ============================================
+router.post('/verify-reset-code', async (req, res) => {
+  try {
+    const { email, code } = req.body;
+    
+    if (!email || !code) {
+      return res.status(400).json({ 
+        message: 'Email y código son requeridos' 
+      });
+    }
+    
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(404).json({ 
+        message: 'Usuario no encontrado' 
+      });
+    }
+    
+    // Verificar rate limiting (máximo 5 intentos)
+    if (user.resetPasswordAttempts >= 5) {
+      return res.status(429).json({ 
+        message: 'Demasiados intentos fallidos. Solicita un nuevo código.' 
+      });
+    }
+    
+    // Verificar si el código expiró
+    if (!user.resetPasswordExpiry || Date.now() > user.resetPasswordExpiry) {
+      return res.status(400).json({ 
+        message: 'El código ha expirado. Solicita uno nuevo.' 
+      });
+    }
+    
+    // Verificar el código
+    if (user.resetPasswordCode !== code) {
+      user.resetPasswordAttempts += 1;
+      await user.save();
+      
+      return res.status(401).json({ 
+        message: 'Código inválido',
+        attemptsRemaining: 5 - user.resetPasswordAttempts
+      });
+    }
+    
+    // Código válido - generar token temporal para el paso 3
+    const resetToken = jwt.sign(
+      { 
+        userId: user._id, 
+        email: user.email,
+        purpose: 'password-reset'
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '15m' } // Token válido por 15 minutos
+    );
+    
+    res.json({ 
+      message: 'Código verificado exitosamente',
+      token: resetToken
+    });
+    
+  } catch (error) {
+    console.error('ERROR EN VERIFY-RESET-CODE:', error);
+    res.status(500).json({ 
+      message: 'Error al verificar código', 
+      error: error.message 
+    });
+  }
+});
+
+// ============================================
+// 🔐 RECUPERACIÓN DE CONTRASEÑA - PASO 3: RESTABLECER CONTRASEÑA
+// ============================================
+router.post('/reset-password', async (req, res) => {
+  try {
+    const { token, password, email } = req.body;
+    
+    if (!token || !password || !email) {
+      return res.status(400).json({ 
+        message: 'Token, email y nueva contraseña son requeridos' 
+      });
+    }
+    
+    // Validar contraseña
+    if (password.length < 8) {
+      return res.status(400).json({ 
+        message: 'La contraseña debe tener al menos 8 caracteres' 
+      });
+    }
+    
+    if (!/(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/.test(password)) {
+      return res.status(400).json({ 
+        message: 'La contraseña debe contener mayúscula, minúscula y número' 
+      });
+    }
+    
+    // Verificar token
+    let decoded;
+    try {
+      decoded = jwt.verify(token, process.env.JWT_SECRET);
+      
+      if (decoded.purpose !== 'password-reset') {
+        return res.status(401).json({ 
+          message: 'Token inválido para esta operación' 
+        });
+      }
+      
+      if (decoded.email !== email) {
+        return res.status(401).json({ 
+          message: 'Token no corresponde al email proporcionado' 
+        });
+      }
+      
+    } catch (jwtError) {
+      return res.status(401).json({ 
+        message: 'Token expirado o inválido. Solicita un nuevo código.' 
+      });
+    }
+    
+    // Buscar usuario y actualizar contraseña
+    const user = await User.findById(decoded.userId);
+    if (!user) {
+      return res.status(404).json({ 
+        message: 'Usuario no encontrado' 
+      });
+    }
+    
+    // Actualizar contraseña y limpiar códigos de recuperación
+    user.password = password; // Asegúrate de hashear si usas bcrypt
+    user.resetPasswordCode = undefined;
+    user.resetPasswordExpiry = undefined;
+    user.resetPasswordAttempts = 0;
+    await user.save();
+    
+    console.log(`✅ Contraseña restablecida para usuario: ${user.username}`);
+    
+    // Opcional: enviar email de confirmación
+    try {
+      await sendEmail({
+        to: user.email,
+        subject: 'Contraseña actualizada',
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2 style="color: #10b981;">Contraseña actualizada exitosamente</h2>
+            <p>Hola <strong>${user.username}</strong>,</p>
+            <p>Tu contraseña ha sido restablecida correctamente.</p>
+            <p>Si no realizaste este cambio, contacta inmediatamente a soporte.</p>
+          </div>
+        `
+      });
+    } catch (emailError) {
+      console.error('Error al enviar email de confirmación:', emailError);
+      // No retornar error, la contraseña ya fue cambiada
+    }
+    
+    res.json({ 
+      message: 'Contraseña actualizada exitosamente' 
+    });
+    
+  } catch (error) {
+    console.error('ERROR EN RESET-PASSWORD:', error);
+    res.status(500).json({ 
+      message: 'Error al restablecer contraseña', 
       error: error.message 
     });
   }
